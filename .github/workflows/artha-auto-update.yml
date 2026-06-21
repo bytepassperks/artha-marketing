@@ -1,0 +1,108 @@
+name: Artha gated auto-update
+
+# $0 set-and-forget upstream tracker. Runs weekly on GitHub's free hosted
+# runners (unlimited minutes on public repos). GATED: it only deploys when the
+# upstream trial-merge is clean AND the Artha rebrand survives the merge
+# (verify-rebrand.sh). On any conflict or branding drift it aborts and opens a
+# GitHub issue - production is never touched.
+#
+# NOTE: scheduled workflows only fire from a repo's DEFAULT branch, so this file
+# must live on the same (branded/deployed) branch the kit operates on.
+
+on:
+  schedule:
+    - cron: '0 4 * * 1'          # every Monday 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (merge + verify only, no deploy)'
+        type: boolean
+        default: true
+      force:
+        description: 'Force deploy even if upstream is unchanged'
+        type: boolean
+        default: false
+
+concurrency:
+  group: artha-auto-update-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.ARTHA_PUSH_TOKEN || github.token }}
+
+      - name: Sanity-check kit present
+        run: |
+          test -f deploy/artha/update.sh || { echo "::error::deploy/artha/update.sh missing"; exit 1; }
+          chmod +x deploy/artha/*.sh
+
+      - name: Wire upstream remote
+        run: |
+          if [ -f deploy/artha/UPSTREAM_URL ] && ! git remote get-url upstream >/dev/null 2>&1; then
+            git remote add upstream "$(head -n1 deploy/artha/UPSTREAM_URL)"
+            echo "upstream -> $(git remote get-url upstream)"
+          fi
+
+      - name: Set up tooling (scalingo CLI + jq)
+        run: |
+          curl -sSL https://cli-dl.scalingo.com/install | bash || true
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          sudo apt-get update -y >/dev/null 2>&1 || true
+          sudo apt-get install -y jq >/dev/null 2>&1 || true
+
+      - name: Run gated auto-update
+        id: run
+        env:
+          SCALINGO_API_TOKEN: ${{ secrets.SCALINGO_API_TOKEN }}
+          GH_TOKEN: ${{ secrets.ARTHA_PUSH_TOKEN || github.token }}
+          DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || inputs.dry_run }}
+          FORCE: ${{ inputs.force || 'false' }}
+        run: |
+          set -o pipefail
+          ARGS=""
+          [ "$DRY_RUN" = "true" ] && ARGS="$ARGS --dry-run"
+          [ "$FORCE" = "true" ]   && ARGS="$ARGS --force"
+          bash deploy/artha/update.sh $ARGS 2>&1 | tee /tmp/artha-update.log
+
+      - name: Open issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.ARTHA_PUSH_TOKEN || github.token }}
+          script: |
+            const fs = require('fs');
+            let log = '';
+            try { log = fs.readFileSync('/tmp/artha-update.log','utf8').slice(-6000); } catch (e) {}
+            const title = `Artha auto-update failed (${new Date().toISOString().slice(0,10)})`;
+            const body = [
+              'The weekly gated auto-update aborted. **Production was not changed.**',
+              '',
+              'Most common causes: an upstream merge conflict, or the Artha rebrand drifted (verify-rebrand.sh failed).',
+              '',
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              '',
+              '<details><summary>Last log lines</summary>',
+              '',
+              '```',
+              log,
+              '```',
+              '</details>',
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['artha-auto-update'],
+            });
